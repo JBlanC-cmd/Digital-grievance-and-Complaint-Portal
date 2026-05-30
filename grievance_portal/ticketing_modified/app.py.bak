@@ -1,0 +1,572 @@
+import os, uuid
+from functools import wraps
+from flask import (Flask, render_template, redirect, url_for, flash,
+                   request, session, send_from_directory, jsonify)
+from werkzeug.security import generate_password_hash, check_password_hash
+from database import get_db, init_db, now_iso, generate_ticket_no
+
+app = Flask(__name__)
+app.secret_key = 'codecrafters-dut-group2-2026'
+UPLOAD_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static', 'uploads')
+app.config['MAX_CONTENT_LENGTH'] = 5 * 1024 * 1024
+ALLOWED = {'pdf','png','jpg','jpeg','doc','docx'}
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def allowed(fn): return '.' in fn and fn.rsplit('.',1)[1].lower() in ALLOWED
+
+def current_user():
+    if 'uid' not in session: return None
+    db = get_db()
+    u = db.execute("""SELECT u.*, d.name as dept_name
+                      FROM users u LEFT JOIN departments d ON u.department_id=d.id
+                      WHERE u.id=? AND u.is_active=1""", (session['uid'],)).fetchone()
+    db.close()
+    return u
+
+def login_required(f):
+    @wraps(f)
+    def dec(*a,**k):
+        if 'uid' not in session:
+            flash('Please log in first.','warning')
+            return redirect(url_for('login'))
+        return f(*a,**k)
+    return dec
+
+def staff_required(f):
+    @wraps(f)
+    def dec(*a,**k):
+        u = current_user()
+        if not u or u['role'] not in ('staff','superadmin'):
+            flash('Staff access required.','danger')
+            return redirect(url_for('dashboard'))
+        return f(*a,**k)
+    return dec
+
+def superadmin_required(f):
+    @wraps(f)
+    def dec(*a,**k):
+        u = current_user()
+        if not u or u['role'] != 'superadmin':
+            flash('Super Admin access required.','danger')
+            return redirect(url_for('admin_dashboard'))
+        return f(*a,**k)
+    return dec
+
+@app.context_processor
+def ctx():
+    u = current_user()
+    unread, notifs = 0, []
+    if u:
+        db = get_db()
+        unread = db.execute("SELECT COUNT(*) FROM notifications WHERE user_id=? AND is_read=0",(u['id'],)).fetchone()[0]
+        notifs = db.execute("SELECT * FROM notifications WHERE user_id=? ORDER BY created_at DESC LIMIT 20",(u['id'],)).fetchall()
+        db.close()
+    return dict(cu=u, unread=unread, notifs=notifs)
+
+def notify(user_id, title, message, ticket_id=None):
+    db = get_db()
+    db.execute("INSERT INTO notifications(user_id,ticket_id,title,message,is_read,created_at) VALUES(?,?,?,?,0,?)",
+               (user_id, ticket_id, title, message, now_iso()))
+    db.commit(); db.close()
+
+# ── Landing ───────────────────────────────────────────────────────────────────
+@app.route('/')
+def index():
+    u = current_user()
+    if u:
+        return redirect(url_for('admin_dashboard') if u['role'] in ('staff','superadmin') else url_for('dashboard'))
+    return render_template('index.html')
+
+# ── Auth ──────────────────────────────────────────────────────────────────────
+@app.route('/login', methods=['GET','POST'])
+def login():
+    if current_user(): return redirect(url_for('index'))
+    if request.method == 'POST':
+        email = request.form.get('email','').strip().lower()
+        pw    = request.form.get('password','')
+        db = get_db()
+        u = db.execute("SELECT * FROM users WHERE email=? AND is_active=1",(email,)).fetchone()
+        db.close()
+        if u and check_password_hash(u['password_hash'], pw):
+            session['uid'] = u['id']
+            session.permanent = request.form.get('remember')=='on'
+            flash(f"Welcome back, {u['full_name'].split()[0]}!",'success')
+            return redirect(url_for('admin_dashboard') if u['role'] in ('staff','superadmin') else url_for('dashboard'))
+        flash('Invalid email or password.','danger')
+    return render_template('auth/login.html')
+
+@app.route('/register', methods=['GET','POST'])
+def register():
+    if current_user(): return redirect(url_for('index'))
+    db = get_db()
+    if request.method == 'POST':
+        name   = request.form.get('full_name','').strip()
+        email  = request.form.get('email','').strip().lower()
+        sno    = request.form.get('student_no','').strip() or None
+        phone  = request.form.get('phone','').strip() or None
+        pw     = request.form.get('password','')
+        cpw    = request.form.get('confirm_password','')
+        errs = []
+        if not name:  errs.append('Full name is required.')
+        if not email or '@' not in email: errs.append('Valid email required.')
+        if db.execute("SELECT id FROM users WHERE email=?",(email,)).fetchone(): errs.append('Email already registered.')
+        if sno and db.execute("SELECT id FROM users WHERE student_no=?",(sno,)).fetchone(): errs.append('Student number already registered.')
+        if len(pw)<8: errs.append('Password must be at least 8 characters.')
+        if pw!=cpw:   errs.append('Passwords do not match.')
+        if errs:
+            db.close()
+            for e in errs: flash(e,'danger')
+            return render_template('auth/register.html', v={'name':name,'email':email,'sno':sno or '','phone':phone or ''})
+        db.execute("INSERT INTO users(student_no,full_name,email,phone,password_hash,role,is_active,created_at) VALUES(?,?,?,?,?,?,1,?)",
+                   (sno, name, email, phone, generate_password_hash(pw), 'student', now_iso()))
+        db.commit()
+        uid = db.execute("SELECT id FROM users WHERE email=?",(email,)).fetchone()['id']
+        db.close()
+        session['uid'] = uid
+        notify(uid,'Welcome to CodeCrafters!','Your account is ready. You can now submit support tickets.')
+        flash('Account created! Welcome to CodeCrafters.','success')
+        return redirect(url_for('dashboard'))
+    db.close()
+    return render_template('auth/register.html', v={'name':'','email':'','sno':'','phone':''})
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    flash('You have been logged out.','info')
+    return redirect(url_for('login'))
+
+# ── Student ───────────────────────────────────────────────────────────────────
+@app.route('/dashboard')
+@login_required
+def dashboard():
+    u = current_user()
+    if u['role'] in ('staff','superadmin'): return redirect(url_for('admin_dashboard'))
+    db = get_db()
+    tickets = db.execute("""
+        SELECT t.*, d.name as dept_name, a.full_name as assignee_name
+        FROM tickets t JOIN departments d ON t.department_id=d.id
+        LEFT JOIN users a ON t.assigned_to=a.id
+        WHERE t.student_id=? ORDER BY t.created_at DESC
+    """,(u['id'],)).fetchall()
+    stats = {
+        'total':       len(tickets),
+        'pending':     sum(1 for t in tickets if t['status']=='Pending'),
+        'in_progress': sum(1 for t in tickets if t['status']=='In Progress'),
+        'resolved':    sum(1 for t in tickets if t['status'] in ('Resolved','Closed')),
+    }
+    recent_notifs = db.execute("SELECT * FROM notifications WHERE user_id=? AND is_read=0 ORDER BY created_at DESC LIMIT 5",(u['id'],)).fetchall()
+    db.close()
+    return render_template('student/dashboard.html', tickets=tickets, stats=stats, notifications=recent_notifs)
+
+@app.route('/submit', methods=['GET','POST'])
+@login_required
+def submit_ticket():
+    u = current_user()
+    if u['role'] in ('staff','superadmin'): return redirect(url_for('admin_dashboard'))
+    db = get_db()
+    departments = db.execute("SELECT * FROM departments ORDER BY name").fetchall()
+    if request.method == 'POST':
+        dept_id  = request.form.get('department_id')
+        subject  = request.form.get('subject','').strip()
+        desc     = request.form.get('description','').strip()
+        priority = request.form.get('priority','Medium')
+        is_anon  = 1 if request.form.get('is_anonymous')=='on' else 0
+        errs = []
+        if not dept_id:            errs.append('Please select a department.')
+        if not subject:            errs.append('Subject is required.')
+        if not desc or len(desc)<10: errs.append('Description must be at least 10 characters.')
+        if errs:
+            db.close()
+            for e in errs: flash(e,'danger')
+            return render_template('student/submit.html', departments=departments)
+
+        tno = generate_ticket_no()
+        while db.execute("SELECT id FROM tickets WHERE ticket_no=?",(tno,)).fetchone(): tno = generate_ticket_no()
+        now = now_iso()
+        db.execute("""INSERT INTO tickets(ticket_no,student_id,department_id,subject,description,priority,status,is_anonymous,created_at,updated_at)
+                      VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                   (tno, u['id'], int(dept_id), subject, desc, priority, 'Pending', is_anon, now, now))
+        db.commit()
+        tid = db.execute("SELECT id FROM tickets WHERE ticket_no=?",(tno,)).fetchone()['id']
+
+        # Attachments
+        for f in request.files.getlist('attachments'):
+            if f and f.filename and allowed(f.filename):
+                ext  = f.filename.rsplit('.',1)[1].lower()
+                fname = f"{uuid.uuid4().hex}.{ext}"
+                f.save(os.path.join(UPLOAD_FOLDER, fname))
+                db.execute("INSERT INTO attachments(ticket_id,filename,original_name,file_size,uploaded_at) VALUES(?,?,?,?,?)",
+                           (tid, fname, f.filename, os.path.getsize(os.path.join(UPLOAD_FOLDER,fname)), now_iso()))
+
+        # Initial audit log
+        db.execute("INSERT INTO ticket_updates(ticket_id,author_id,new_status,message,is_internal,created_at) VALUES(?,?,?,?,0,?)",
+                   (tid, u['id'], 'Pending', 'Ticket submitted successfully.', now_iso()))
+        db.commit()
+
+        # Notify student
+        notify(u['id'], 'Ticket Submitted', f'Ticket "{subject}" submitted. Ref: {tno}', tid)
+        # Notify all staff in that department + superadmins
+        staff = db.execute("SELECT id FROM users WHERE (department_id=? OR role='superadmin') AND is_active=1 AND role IN ('staff','superadmin')",(int(dept_id),)).fetchall()
+        db.close()
+        for s in staff: notify(s['id'], 'New Ticket Received', f'New {priority} ticket in your department. Ref: {tno}', tid)
+
+        flash(f'Ticket submitted! Reference: <strong>{tno}</strong>','success')
+        return redirect(url_for('view_ticket', tno=tno))
+    db.close()
+    return render_template('student/submit.html', departments=departments)
+
+@app.route('/ticket/<tno>')
+@login_required
+def view_ticket(tno):
+    u = current_user()
+    db = get_db()
+    ticket = db.execute("""
+        SELECT t.*, d.name as dept_name, s.full_name as student_name, s.email as student_email,
+               s.student_no, a.full_name as assignee_name
+        FROM tickets t JOIN departments d ON t.department_id=d.id
+        JOIN users s ON t.student_id=s.id LEFT JOIN users a ON t.assigned_to=a.id
+        WHERE t.ticket_no=?
+    """,(tno,)).fetchone()
+    if not ticket: db.close(); flash('Ticket not found.','danger'); return redirect(url_for('dashboard'))
+    is_staff = u['role'] in ('staff','superadmin')
+    if not is_staff and ticket['student_id'] != u['id']:
+        db.close(); flash('Access denied.','danger'); return redirect(url_for('dashboard'))
+    q = "SELECT tu.*, u.full_name as author_name, u.role as author_role FROM ticket_updates tu JOIN users u ON tu.author_id=u.id WHERE tu.ticket_id=?"
+    if not is_staff: q += " AND tu.is_internal=0"
+    q += " ORDER BY tu.created_at ASC"
+    updates = db.execute(q,(ticket['id'],)).fetchall()
+    attachments = db.execute("SELECT * FROM attachments WHERE ticket_id=?",(ticket['id'],)).fetchall()
+    db.close()
+    return render_template('student/ticket_detail.html', ticket=ticket, updates=updates, attachments=attachments, is_staff=is_staff)
+
+@app.route('/ticket/<tno>/rate', methods=['POST'])
+@login_required
+def rate_ticket(tno):
+    u = current_user()
+    db = get_db()
+    ticket = db.execute("SELECT * FROM tickets WHERE ticket_no=? AND student_id=?",(tno, u['id'])).fetchone()
+    if ticket and ticket['status'] in ('Resolved','Closed') and not ticket['rating']:
+        rating  = request.form.get('rating','5')
+        comment = request.form.get('rating_comment','').strip()
+        db.execute("UPDATE tickets SET rating=?,rating_comment=? WHERE id=?",(int(rating), comment or None, ticket['id']))
+        db.commit()
+        flash('Thank you for your feedback!','success')
+    db.close()
+    return redirect(url_for('view_ticket', tno=tno))
+
+@app.route('/my-tickets')
+@login_required
+def my_tickets():
+    u = current_user()
+    if u['role'] in ('staff','superadmin'): return redirect(url_for('admin_dashboard'))
+    db = get_db()
+    status = request.args.get('status','')
+    dept   = request.args.get('dept','')
+    q      = request.args.get('q','')
+    sql = "SELECT t.*, d.name as dept_name FROM tickets t JOIN departments d ON t.department_id=d.id WHERE t.student_id=?"
+    params = [u['id']]
+    if status: sql += " AND t.status=?"; params.append(status)
+    if dept:   sql += " AND t.department_id=?"; params.append(int(dept))
+    if q:      sql += " AND (t.subject LIKE ? OR t.ticket_no LIKE ?)"; params += [f'%{q}%',f'%{q}%']
+    sql += " ORDER BY t.created_at DESC"
+    tickets = db.execute(sql, params).fetchall()
+    departments = db.execute("SELECT * FROM departments ORDER BY name").fetchall()
+    db.close()
+    return render_template('student/my_tickets.html', tickets=tickets, departments=departments,
+                           status=status, dept=dept, q=q)
+
+@app.route('/notifications/read/<int:nid>')
+@login_required
+def mark_read(nid):
+    u = current_user()
+    db = get_db()
+    db.execute("UPDATE notifications SET is_read=1 WHERE id=? AND user_id=?",(nid,u['id']))
+    db.commit(); db.close()
+    return redirect(request.referrer or url_for('dashboard'))
+
+@app.route('/notifications/read-all')
+@login_required
+def mark_all_read():
+    u = current_user()
+    db = get_db()
+    db.execute("UPDATE notifications SET is_read=1 WHERE user_id=?",(u['id'],))
+    db.commit(); db.close()
+    return redirect(request.referrer or url_for('dashboard'))
+
+@app.route('/profile', methods=['GET','POST'])
+@login_required
+def profile():
+    u = current_user()
+    db = get_db()
+    if request.method == 'POST':
+        name  = request.form.get('full_name','').strip()
+        phone = request.form.get('phone','').strip() or None
+        npw   = request.form.get('new_password','')
+        cpw   = request.form.get('confirm_password','')
+        if npw:
+            if len(npw)<8: flash('Password must be at least 8 characters.','danger'); db.close(); return redirect(url_for('profile'))
+            if npw!=cpw:   flash('Passwords do not match.','danger'); db.close(); return redirect(url_for('profile'))
+            db.execute("UPDATE users SET full_name=?,phone=?,password_hash=? WHERE id=?",(name,phone,generate_password_hash(npw),u['id']))
+        else:
+            db.execute("UPDATE users SET full_name=?,phone=? WHERE id=?",(name,phone,u['id']))
+        db.commit(); db.close()
+        flash('Profile updated.','success')
+        return redirect(url_for('profile'))
+    total = db.execute("SELECT COUNT(*) FROM tickets WHERE student_id=?",(u['id'],)).fetchone()[0]
+    db.close()
+    return render_template('student/profile.html', u=u, total_tickets=total)
+
+@app.route('/uploads/<filename>')
+@login_required
+def uploaded_file(filename):
+    return send_from_directory(UPLOAD_FOLDER, filename)
+
+# ── Admin / Staff ─────────────────────────────────────────────────────────────
+@app.route('/admin')
+@app.route('/admin/dashboard')
+@login_required
+@staff_required
+def admin_dashboard():
+    u = current_user()
+    db = get_db()
+    stats = {
+        'total':       db.execute("SELECT COUNT(*) FROM tickets").fetchone()[0],
+        'pending':     db.execute("SELECT COUNT(*) FROM tickets WHERE status='Pending'").fetchone()[0],
+        'in_progress': db.execute("SELECT COUNT(*) FROM tickets WHERE status='In Progress'").fetchone()[0],
+        'resolved':    db.execute("SELECT COUNT(*) FROM tickets WHERE status IN ('Resolved','Closed')").fetchone()[0],
+        'urgent':      db.execute("SELECT COUNT(*) FROM tickets WHERE priority='Urgent'").fetchone()[0],
+    }
+    # Dept filter for staff
+    dept_filter = ""
+    params = []
+    if u['role'] == 'staff' and u['department_id']:
+        dept_filter = " WHERE t.department_id=?"; params = [u['department_id']]
+
+    recent = db.execute(f"""SELECT t.*, d.name as dept_name, s.full_name as student_name,
+                                   a.full_name as assignee_name
+                            FROM tickets t JOIN departments d ON t.department_id=d.id
+                            JOIN users s ON t.student_id=s.id LEFT JOIN users a ON t.assigned_to=a.id
+                            {dept_filter}
+                            ORDER BY t.created_at DESC LIMIT 10""", params).fetchall()
+
+    dept_stats = db.execute("""SELECT d.name, COUNT(t.id) as cnt FROM departments d
+                               LEFT JOIN tickets t ON t.department_id=d.id
+                               GROUP BY d.id ORDER BY cnt DESC""").fetchall()
+    db.close()
+    return render_template('admin/dashboard.html', stats=stats, recent=recent, dept_stats=dept_stats)
+
+@app.route('/admin/tickets')
+@login_required
+@staff_required
+def admin_tickets():
+    u = current_user()
+    db = get_db()
+    status   = request.args.get('status','')
+    priority = request.args.get('priority','')
+    dept_id  = request.args.get('dept','')
+    assigned = request.args.get('assigned','')
+    q        = request.args.get('q','')
+
+    sql = """SELECT t.*, d.name as dept_name, s.full_name as student_name,
+                    s.student_no, a.full_name as assignee_name
+             FROM tickets t JOIN departments d ON t.department_id=d.id
+             JOIN users s ON t.student_id=s.id LEFT JOIN users a ON t.assigned_to=a.id
+             WHERE 1=1"""
+    params = []
+    # Staff only see their dept
+    if u['role'] == 'staff' and u['department_id']:
+        sql += " AND t.department_id=?"; params.append(u['department_id'])
+    if status:   sql += " AND t.status=?";       params.append(status)
+    if priority: sql += " AND t.priority=?";     params.append(priority)
+    if dept_id and u['role']=='superadmin': sql += " AND t.department_id=?"; params.append(int(dept_id))
+    if assigned == 'me':           sql += " AND t.assigned_to=?";  params.append(u['id'])
+    elif assigned == 'unassigned': sql += " AND t.assigned_to IS NULL"
+    if q: sql += " AND (t.subject LIKE ? OR t.ticket_no LIKE ? OR s.full_name LIKE ?)"; params += [f'%{q}%']*3
+    sql += " ORDER BY CASE t.priority WHEN 'Urgent' THEN 1 WHEN 'High' THEN 2 WHEN 'Medium' THEN 3 ELSE 4 END, t.created_at DESC"
+
+    tickets = db.execute(sql, params).fetchall()
+    departments = db.execute("SELECT * FROM departments ORDER BY name").fetchall()
+    db.close()
+    return render_template('admin/tickets.html', tickets=tickets, departments=departments,
+                           status=status, priority=priority, dept_id=dept_id, assigned=assigned, q=q)
+
+@app.route('/admin/ticket/<tno>', methods=['GET','POST'])
+@login_required
+@staff_required
+def admin_view_ticket(tno):
+    u = current_user()
+    db = get_db()
+    ticket = db.execute("""
+        SELECT t.*, d.name as dept_name, d.id as dept_id,
+               s.full_name as student_name, s.email as student_email, s.student_no, s.phone as student_phone,
+               a.full_name as assignee_name
+        FROM tickets t JOIN departments d ON t.department_id=d.id
+        JOIN users s ON t.student_id=s.id LEFT JOIN users a ON t.assigned_to=a.id
+        WHERE t.ticket_no=?
+    """,(tno,)).fetchone()
+    if not ticket: db.close(); flash('Ticket not found.','danger'); return redirect(url_for('admin_tickets'))
+
+    if request.method == 'POST':
+        action      = request.form.get('action')
+        message     = request.form.get('message','').strip()
+        is_internal = 1 if request.form.get('is_internal')=='on' else 0
+        now = now_iso()
+
+        if action == 'update_status':
+            new_status = request.form.get('new_status')
+            old_status = ticket['status']
+            resolved_at = now if new_status in ('Resolved','Closed') else None
+            db.execute("UPDATE tickets SET status=?,updated_at=?,resolved_at=? WHERE id=?",(new_status,now,resolved_at,ticket['id']))
+            db.execute("INSERT INTO ticket_updates(ticket_id,author_id,old_status,new_status,message,is_internal,created_at) VALUES(?,?,?,?,?,?,?)",
+                       (ticket['id'],u['id'],old_status,new_status,message or f"Status updated to {new_status}",is_internal,now))
+            db.commit()
+            if not is_internal:
+                notify(ticket['student_id'],'Ticket Status Updated',
+                       f"Ticket {tno}: status changed to {new_status}",ticket['id'])
+            flash('Status updated.','success')
+
+        elif action == 'assign':
+            aid = request.form.get('staff_id') or None
+            db.execute("UPDATE tickets SET assigned_to=?,updated_at=? WHERE id=?",(aid,now,ticket['id']))
+            aname = db.execute("SELECT full_name FROM users WHERE id=?",(int(aid),)).fetchone()['full_name'] if aid else 'Unassigned'
+            db.execute("INSERT INTO ticket_updates(ticket_id,author_id,message,is_internal,created_at) VALUES(?,?,?,1,?)",
+                       (ticket['id'],u['id'],f"Assigned to {aname}",now))
+            db.commit()
+            flash('Ticket assigned.','success')
+
+        elif action == 'comment':
+            if message:
+                db.execute("INSERT INTO ticket_updates(ticket_id,author_id,message,is_internal,created_at) VALUES(?,?,?,?,?)",
+                           (ticket['id'],u['id'],message,is_internal,now))
+                db.commit()
+                if not is_internal:
+                    notify(ticket['student_id'],'New Update on Your Ticket',
+                           f"Staff added a comment to ticket {tno}.",ticket['id'])
+                flash('Comment added.','success')
+
+        db.close()
+        return redirect(url_for('admin_view_ticket', tno=tno))
+
+    staff_list = db.execute("SELECT * FROM users WHERE department_id=? AND is_active=1 AND role='staff'",(ticket['dept_id'],)).fetchall()
+    updates    = db.execute("""SELECT tu.*, u.full_name as author_name, u.role as author_role
+                               FROM ticket_updates tu JOIN users u ON tu.author_id=u.id
+                               WHERE tu.ticket_id=? ORDER BY tu.created_at ASC""",(ticket['id'],)).fetchall()
+    attachments = db.execute("SELECT * FROM attachments WHERE ticket_id=?",(ticket['id'],)).fetchall()
+    db.close()
+    return render_template('admin/ticket_detail.html', ticket=ticket, staff_list=staff_list,
+                           updates=updates, attachments=attachments)
+
+@app.route('/admin/users')
+@login_required
+@staff_required
+def admin_users():
+    db = get_db()
+    role  = request.args.get('role','')
+    q     = request.args.get('q','')
+    sql   = "SELECT u.*, d.name as dept_name, (SELECT COUNT(*) FROM tickets WHERE student_id=u.id) as ticket_count FROM users u LEFT JOIN departments d ON u.department_id=d.id WHERE 1=1"
+    params = []
+    if role: sql += " AND u.role=?"; params.append(role)
+    if q:    sql += " AND (u.full_name LIKE ? OR u.email LIKE ?)"; params += [f'%{q}%']*2
+    sql += " ORDER BY u.created_at DESC"
+    users = db.execute(sql, params).fetchall()
+    departments = db.execute("SELECT * FROM departments ORDER BY name").fetchall()
+    db.close()
+    return render_template('admin/users.html', users=users, departments=departments, role=role, q=q)
+
+@app.route('/admin/users/add', methods=['GET','POST'])
+@login_required
+@staff_required
+def add_user():
+    u = current_user()
+    db = get_db()
+    departments = db.execute("SELECT * FROM departments ORDER BY name").fetchall()
+    if request.method == 'POST':
+        name   = request.form.get('full_name','').strip()
+        email  = request.form.get('email','').strip().lower()
+        role   = request.form.get('role','student')
+        dept_id= request.form.get('department_id') or None
+        pw     = request.form.get('password','') or 'ChangeMe123!'
+        if u['role']!='superadmin' and role in ('staff','superadmin'):
+            flash('Only Super Admins can create staff accounts.','danger'); db.close(); return redirect(url_for('admin_users'))
+        if db.execute("SELECT id FROM users WHERE email=?",(email,)).fetchone():
+            flash('Email already exists.','danger'); db.close(); return redirect(url_for('add_user'))
+        db.execute("INSERT INTO users(full_name,email,password_hash,role,department_id,is_active,created_at) VALUES(?,?,?,?,?,1,?)",
+                   (name,email,generate_password_hash(pw),role,dept_id,now_iso()))
+        db.commit(); db.close()
+        flash(f'User {name} created.','success')
+        return redirect(url_for('admin_users'))
+    db.close()
+    return render_template('admin/add_user.html', departments=departments)
+
+@app.route('/admin/users/<int:uid>/toggle')
+@login_required
+@staff_required
+def toggle_user(uid):
+    u = current_user()
+    if uid == u['id']: flash("You can't deactivate yourself.",'warning'); return redirect(url_for('admin_users'))
+    db = get_db()
+    cur = db.execute("SELECT is_active FROM users WHERE id=?",(uid,)).fetchone()['is_active']
+    db.execute("UPDATE users SET is_active=? WHERE id=?",(0 if cur else 1, uid))
+    db.commit(); db.close()
+    flash(f'User {"deactivated" if cur else "activated"}.','success')
+    return redirect(url_for('admin_users'))
+
+@app.route('/admin/departments', methods=['GET','POST'])
+@login_required
+@superadmin_required
+def admin_departments():
+    db = get_db()
+    if request.method == 'POST':
+        name  = request.form.get('name','').strip()
+        email = request.form.get('email','').strip()
+        head  = request.form.get('head','').strip()
+        if name:
+            if db.execute("SELECT id FROM departments WHERE name=?",(name,)).fetchone():
+                flash('Department already exists.','warning')
+            else:
+                db.execute("INSERT INTO departments(name,email,head) VALUES(?,?,?)",(name,email,head))
+                db.commit(); flash('Department added.','success')
+        db.close(); return redirect(url_for('admin_departments'))
+    depts = db.execute("SELECT d.*,(SELECT COUNT(*) FROM tickets WHERE department_id=d.id) as cnt FROM departments d ORDER BY d.name").fetchall()
+    db.close()
+    return render_template('admin/departments.html', departments=depts)
+
+@app.route('/admin/reports')
+@login_required
+@staff_required
+def admin_reports():
+    db = get_db()
+    total    = db.execute("SELECT COUNT(*) FROM tickets").fetchone()[0]
+    resolved = db.execute("SELECT COUNT(*) FROM tickets WHERE status IN ('Resolved','Closed')").fetchone()[0]
+    pending  = db.execute("SELECT COUNT(*) FROM tickets WHERE status='Pending'").fetchone()[0]
+    in_prog  = db.execute("SELECT COUNT(*) FROM tickets WHERE status='In Progress'").fetchone()[0]
+    dept_stats = db.execute("""SELECT d.name, COUNT(t.id) as cnt FROM departments d
+                               LEFT JOIN tickets t ON t.department_id=d.id
+                               GROUP BY d.name HAVING cnt>0 ORDER BY cnt DESC""").fetchall()
+    prio_stats = db.execute("SELECT priority, COUNT(*) as cnt FROM tickets GROUP BY priority ORDER BY cnt DESC").fetchall()
+    avg_rating = db.execute("SELECT ROUND(AVG(rating),1) as avg FROM tickets WHERE rating IS NOT NULL").fetchone()['avg']
+    db.close()
+    return render_template('admin/reports.html', total=total, resolved=resolved,
+                           pending=pending, in_prog=in_prog, dept_stats=dept_stats,
+                           prio_stats=prio_stats, avg_rating=avg_rating or 'N/A')
+
+@app.route('/admin/api/stats')
+@login_required
+@staff_required
+def api_stats():
+    db = get_db()
+    data = {
+        'total':    db.execute("SELECT COUNT(*) FROM tickets").fetchone()[0],
+        'pending':  db.execute("SELECT COUNT(*) FROM tickets WHERE status='Pending'").fetchone()[0],
+        'resolved': db.execute("SELECT COUNT(*) FROM tickets WHERE status IN ('Resolved','Closed')").fetchone()[0],
+    }
+    db.close()
+    return jsonify(data)
+
+# ── Boot ──────────────────────────────────────────────────────────────────────
+with app.app_context():
+    init_db()
+
+if __name__ == '__main__':
+    app.run(debug=True, port=5000)
